@@ -36,13 +36,23 @@ def get_unique_root_path(raw_file):
             break
     return os.path.normpath(dir_path).replace('\\', '/').lower()
 
+def extract_movie_folder(filepath):
+    """
+    주어진 경로에서 실제 영화 폴더명을 추출합니다.
+    기준 경로 패턴: /영화/제목/[가~0Z 등 임의의폴더]/[실제_영화_폴더명]/
+    """
+    match = re.search(r'/영화/제목/[^/]+/([^/]+)/', filepath)
+    if match:
+        return match.group(1)
+    
+    return os.path.basename(os.path.dirname(filepath))
+
 # =====================================================================
 # 1. PMH Tool 표준 인터페이스 (UI 스키마)
 # =====================================================================
 def get_ui(core_api):
     sections = [{"value": "all", "text": "전체 라이브러리 (All)"}]
     try:
-        # 안전한 샌드박스 DB 쿼리 실행 (코어가 제공하는 읽기 전용 쿼리)
         rows = core_api['query']("SELECT id, name FROM library_sections ORDER BY name")
         for r in rows:
             sections.append({"value": str(r['id']), "text": r['name']})
@@ -65,9 +75,16 @@ def get_ui(core_api):
                 "label": "수행할 작업 선택",
                 "options": [
                     {"value": "find_multipath", "text": "단순 조회: 잘못 병합된 다중 경로 항목 찾기"},
-                    {"value": "split_multipath", "text": "[1단계] 풀기: 제목 폴더가 다른 데 묶인 경우 자동 분리 (Split)"},
-                    {"value": "find_duplicate_guid", "text": "[2단계] 찾기: 제목과 GUID가 같은 중복 항목 검색 (링크 제공)"}
+                    {"value": "split_multipath", "text": "[1단계] 일괄 풀기: 제목 폴더가 다른 데 묶인 항목 모두 자동 분리"},
+                    {"value": "find_duplicate_guid", "text": "[2단계] 찾기: 제목과 GUID가 같은 중복 항목 검색"},
+                    {"value": "manual_split", "text": "[특수] 특정 항목 수동 분리 (아래에 ID 입력)"}
                 ]
+            },
+            {
+                "id": "target_rk",
+                "type": "text",
+                "label": "수동 분리할 ID (Rating Key) - 수동 분리 선택 시에만 동작",
+                "placeholder": "예: 123456"
             }
         ],
         "button_text": "작업 실행"
@@ -77,7 +94,6 @@ def get_ui(core_api):
 # 2. 메인 실행 및 데이터 추출 로직
 # =====================================================================
 def run(data, core_api):
-    # 페이지/정렬 요청은 코어가 자체적으로 캐시를 읽어 처리하므로 예외를 던집니다.
     action = data.get('action_type', 'preview')
     if action == 'page': 
         return {"status": "error", "message": "데이터테이블 툴은 페이징을 코어가 전담합니다."}, 400
@@ -88,13 +104,41 @@ def run(data, core_api):
     task = core_api['task']
     task.log(f"작업 시작 (대상 섹션: {section_id}, 작업 유형: {work_type})")
     
-    # 기기 식별자(Machine ID) 가져오기 (Plex Web URL 생성용)
+    # 기기 식별자(Machine ID) 가져오기
     machine_id = ""
     try:
         plex = core_api['get_plex']()
         machine_id = plex.machineIdentifier
     except Exception as e:
         task.log(f"Plex 서버 연결 중 오류 (클릭 링크 생성이 제한될 수 있음): {e}")
+
+    # -------------------------------------------------------------------------
+    # [작업 0] 특정 항목 수동 분리 (Rating Key 입력)
+    # -------------------------------------------------------------------------
+    if work_type == 'manual_split':
+        target_rk = data.get('target_rk', '').strip()
+        if not target_rk.isdigit():
+            return {"status": "error", "message": "유효한 ID(숫자)를 입력해주세요."}, 400
+            
+        task.log(f"수동 분리 시작 (ID: {target_rk})...")
+        try:
+            plex = core_api['get_plex']()
+            item = plex.fetchItem(int(target_rk))
+            title = item.title
+            item.split()
+            task.update_state('running', progress=100, total=100)
+            task.log(f"[성공] '{title}' 항목이 분리되었습니다.")
+            
+            return {
+                "status": "success",
+                "type": "datatable",
+                "default_sort": [],
+                "columns": [{"key": "result", "label": "수동 처리 결과", "width": "100%", "align": "center"}],
+                "data": [{"result": f"<span style='color:#28a745; font-weight:bold;'>성공적으로 분리되었습니다: {title}</span>"}]
+            }, 200
+        except Exception as e:
+            task.log(f"수동 분리 실패: {e}")
+            return {"status": "error", "message": f"수동 분리 실패: {str(e)}"}, 500
 
     # -------------------------------------------------------------------------
     # [작업 1 & 2] 다중 경로 검색 및 분리(Split)
@@ -138,12 +182,11 @@ def run(data, core_api):
                     custom_plex_url = "#"
                     official_plex_url = "#"
                     
-                html_title = f"<a href='{custom_plex_url}' target='_blank' style='color: #007bff; text-decoration: underline; cursor: pointer; margin-right: 8px;' title='개인 도메인으로 열기'>{title}</a>"
-                html_title += f"<a href='{official_plex_url}' target='_blank' style='color: #6c757d; font-size: 0.8em; text-decoration: none;' title='Plex 공식 웹으로 열기'>[공식]</a>"
+                html_title = f"<div style='margin-bottom: 4px;'><a href='{custom_plex_url}' target='_blank' style='color: #007bff; text-decoration: underline; font-weight: bold; cursor: pointer;' title='개인 도메인으로 열기'>{title}</a></div>"
+                html_title += f"<div><a href='{official_plex_url}' target='_blank' style='color: #6c757d; font-size: 0.85em; text-decoration: none; padding: 2px 6px; border: 1px solid #ccc; border-radius: 4px;' title='Plex 공식 웹으로 열기'>공식 앱 열기 ↗</a></div>"
                 
                 root_paths = set()
                 
-                # 영화 (Type 1) 및 TV 쇼 (Type 2) 공통 처리
                 if m_type == 1:
                     files = core_api['query']("""
                         SELECT mp.file FROM media_items m 
@@ -154,7 +197,7 @@ def run(data, core_api):
                     for row in files:
                         if row.get('file'):
                             raw_file = unicodedata.normalize('NFC', row['file'])
-                            root_paths.add(get_unique_root_path(raw_file))
+                            root_paths.add(extract_movie_folder(raw_file))
                 
                 elif m_type == 2:
                     files = core_api['query']("""
@@ -170,24 +213,23 @@ def run(data, core_api):
                             raw_file = unicodedata.normalize('NFC', row['file'])
                             root_paths.add(get_unique_root_path(raw_file))
 
-                # 루트 폴더가 서로 다른 2개 이상이 묶여있다면 타겟으로 지정
                 if len(root_paths) > 1:
-                    # 화면 표시용으로 폴더 경로의 제일 마지막 이름(영화제목, 쇼제목)만 추출
+                    # 화면 표시용: 폴더명을 각각의 줄(div)로 분리하여 여러 줄로 렌더링
                     display_folders = [os.path.basename(p) for p in root_paths]
+                    folder_html = "".join([f"<div style='margin-bottom: 4px; font-size: 0.9em; white-space: nowrap; background-color: rgba(255,255,255,0.05); padding: 4px; border-radius: 4px;'>📂 {f}</div>" for f in display_folders])
                     
                     item_data = {
                         "section": sec_name,
-                        "title": html_title,       # HTML 링크로 감싸진 제목
-                        "raw_title": title,        # 테이블 정렬(가나다순)을 위한 순수 제목
-                        "rating_key": str(rk_id),
+                        "title": html_title,       
+                        "raw_title": title,        
+                        "rating_key": str(rk_id),  # 표에 출력하기 위해 추가
                         "count": f"<span style='color:#e5a00d; font-weight:bold;'>{len(root_paths)}</span>",
                         "raw_count": len(root_paths),
-                        "folders": ", ".join(display_folders) # 깔끔하게 잘린 폴더명 목록
+                        "folders": folder_html     # 두 줄 이상으로 예쁘게 나오는 HTML
                     }
                     results.append(item_data)
                     targets_to_split.append(item_data)
             
-            # [자동 분리 수행]
             if work_type == 'split_multipath' and targets_to_split:
                 task.log(f"3. 총 {len(targets_to_split)}개의 병합 의심 항목을 분리(Split) 합니다...")
                 try:
@@ -217,11 +259,11 @@ def run(data, core_api):
                 "type": "datatable",
                 "default_sort": [{"key": "section", "dir": "asc"}, {"key": "title", "dir": "asc"}],
                 "columns": [
-                    {"key": "section", "label": "섹션", "width": "15%", "align": "left", "header_align": "center", "sortable": True},
-                    # HTML title을 사용하므로 type 속성 삭제, 정렬은 raw_title로 하도록 수정
+                    {"key": "section", "label": "섹션", "width": "10%", "align": "left", "header_align": "center", "sortable": True},
                     {"key": "title", "label": "제목 (클릭 시 새창 열림)", "width": "35%", "align": "left", "header_align": "center", "sortable": True, "sort_key": "raw_title", "sort_type": "string"},
-                    {"key": "folders", "label": "감지된 폴더명", "width": "40%", "align": "left", "header_align": "center", "sortable": False},
-                    {"key": "count", "label": "상태/병합수", "width": "10%", "align": "center", "header_align": "center", "sortable": True, "sort_key": "raw_count", "sort_type": "number"}
+                    {"key": "folders", "label": "감지된 폴더명", "width": "35%", "align": "left", "header_align": "center", "sortable": False},
+                    {"key": "rating_key", "label": "ID (RK)", "width": "10%", "align": "center", "header_align": "center", "sortable": False},
+                    {"key": "count", "label": "상태/수", "width": "10%", "align": "center", "header_align": "center", "sortable": True, "sort_key": "raw_count", "sort_type": "number"}
                 ],
                 "data": results
             }, 200
@@ -259,7 +301,6 @@ def run(data, core_api):
                 clean_guid = item['guid'].split("://")[-1].split("?")[0] if "://" in item['guid'] else item['guid']
                 title = item['title']
                 
-                # 강제 새 창 열기 HTML 링크 생성 (개인 도메인 우선, 공식 웹 보조)
                 key_encoded = urllib.parse.quote(f"/library/metadata/{rk_id}", safe='')
                 if machine_id:
                     custom_plex_url = f"https://plex.padossi.com/web/index.html#!/server/{machine_id}/details?key={key_encoded}"
@@ -268,8 +309,8 @@ def run(data, core_api):
                     custom_plex_url = "#"
                     official_plex_url = "#"
                     
-                html_title = f"<a href='{custom_plex_url}' target='_blank' style='color: #007bff; text-decoration: underline; cursor: pointer; margin-right: 8px;' title='개인 도메인으로 열기'>{title}</a>"
-                html_title += f"<a href='{official_plex_url}' target='_blank' style='color: #6c757d; font-size: 0.8em; text-decoration: none;' title='Plex 공식 웹으로 열기'>[공식]</a>"
+                html_title = f"<div style='margin-bottom: 4px;'><a href='{custom_plex_url}' target='_blank' style='color: #007bff; text-decoration: underline; font-weight: bold; cursor: pointer;' title='개인 도메인으로 열기'>{title}</a></div>"
+                html_title += f"<div><a href='{official_plex_url}' target='_blank' style='color: #6c757d; font-size: 0.85em; text-decoration: none; padding: 2px 6px; border: 1px solid #ccc; border-radius: 4px;' title='Plex 공식 웹으로 열기'>공식 앱 열기 ↗</a></div>"
                 
                 results.append({
                     "section": item['section_name'],
@@ -287,8 +328,8 @@ def run(data, core_api):
                 "default_sort": [{"key": "guid", "dir": "asc"}, {"key": "title", "dir": "asc"}],
                 "columns": [
                     {"key": "section", "label": "섹션", "width": "15%", "align": "left", "header_align": "center", "sortable": True},
-                    # HTML title을 사용하므로 type 속성 삭제, 정렬은 raw_title로 하도록 수정
-                    {"key": "title", "label": "제목 (클릭 시 새창 열림)", "width": "50%", "align": "left", "header_align": "center", "sortable": True, "sort_key": "raw_title", "sort_type": "string"},
+                    {"key": "title", "label": "제목 (클릭 시 새창 열림)", "width": "40%", "align": "left", "header_align": "center", "sortable": True, "sort_key": "raw_title", "sort_type": "string"},
+                    {"key": "rating_key", "label": "ID (RK)", "width": "10%", "align": "center", "header_align": "center", "sortable": False},
                     {"key": "guid", "label": "Plex GUID", "width": "35%", "align": "left", "header_align": "center", "sortable": True}
                 ],
                 "data": results
