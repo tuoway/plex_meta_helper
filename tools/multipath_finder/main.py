@@ -129,10 +129,17 @@ def run(data, core_api):
                 title = candidate['title']
                 sec_name = candidate['section_name']
                 
-                # 강제 새 창 열기 HTML 링크 생성
+                # 강제 새 창 열기 HTML 링크 생성 (개인 도메인 우선, 공식 웹 보조)
                 key_encoded = urllib.parse.quote(f"/library/metadata/{rk_id}", safe='')
-                plex_web_url = f"https://app.plex.tv/desktop/#!/server/{machine_id}/details?key={key_encoded}" if machine_id else "#"
-                html_title = f"<a href='{plex_web_url}' target='_blank' style='color: #007bff; text-decoration: underline; cursor: pointer;'>{title}</a>"
+                if machine_id:
+                    custom_plex_url = f"https://plex.padossi.com/web/index.html#!/server/{machine_id}/details?key={key_encoded}"
+                    official_plex_url = f"https://app.plex.tv/desktop/#!/server/{machine_id}/details?key={key_encoded}"
+                else:
+                    custom_plex_url = "#"
+                    official_plex_url = "#"
+                    
+                html_title = f"<a href='{custom_plex_url}' target='_blank' style='color: #007bff; text-decoration: underline; cursor: pointer; margin-right: 8px;' title='개인 도메인으로 열기'>{title}</a>"
+                html_title += f"<a href='{official_plex_url}' target='_blank' style='color: #6c757d; font-size: 0.8em; text-decoration: none;' title='Plex 공식 웹으로 열기'>[공식]</a>"
                 
                 root_paths = set()
                 
@@ -252,10 +259,17 @@ def run(data, core_api):
                 clean_guid = item['guid'].split("://")[-1].split("?")[0] if "://" in item['guid'] else item['guid']
                 title = item['title']
                 
-                # 강제 새 창 열기 HTML 링크 생성
+                # 강제 새 창 열기 HTML 링크 생성 (개인 도메인 우선, 공식 웹 보조)
                 key_encoded = urllib.parse.quote(f"/library/metadata/{rk_id}", safe='')
-                plex_web_url = f"https://app.plex.tv/desktop/#!/server/{machine_id}/details?key={key_encoded}" if machine_id else "#"
-                html_title = f"<a href='{plex_web_url}' target='_blank' style='color: #007bff; text-decoration: underline; cursor: pointer;'>{title}</a>"
+                if machine_id:
+                    custom_plex_url = f"https://plex.padossi.com/web/index.html#!/server/{machine_id}/details?key={key_encoded}"
+                    official_plex_url = f"https://app.plex.tv/desktop/#!/server/{machine_id}/details?key={key_encoded}"
+                else:
+                    custom_plex_url = "#"
+                    official_plex_url = "#"
+                    
+                html_title = f"<a href='{custom_plex_url}' target='_blank' style='color: #007bff; text-decoration: underline; cursor: pointer; margin-right: 8px;' title='개인 도메인으로 열기'>{title}</a>"
+                html_title += f"<a href='{official_plex_url}' target='_blank' style='color: #6c757d; font-size: 0.8em; text-decoration: none;' title='Plex 공식 웹으로 열기'>[공식]</a>"
                 
                 results.append({
                     "section": item['section_name'],
