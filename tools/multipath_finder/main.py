@@ -13,6 +13,8 @@ import urllib.parse
 import unicodedata
 import os
 import re
+import json
+import glob
 
 def is_season_folder(folder_name):
     """폴더명이 시즌(Season) 폴더인지 판별합니다."""
@@ -72,17 +74,18 @@ def get_ui(core_api):
             {
                 "id": "work_type",
                 "type": "select",
-                "label": "수행할 기본 작업 선택",
+                "label": "수행할 작업 선택",
                 "options": [
                     {"value": "find_multipath", "text": "단순 조회: 잘못 병합된 다중 경로 항목 찾기"},
                     {"value": "split_multipath", "text": "[1단계] 일괄 풀기: 제목 폴더가 다른 데 묶인 항목 모두 자동 분리"},
-                    {"value": "find_duplicate_guid", "text": "[2단계] 찾기: 제목과 GUID가 같은 중복 항목 검색"}
+                    {"value": "find_duplicate_guid", "text": "[2단계] 찾기: 제목과 GUID가 같은 중복 항목 검색"},
+                    {"value": "manual_split", "text": "[특수] 특정 항목 수동 분리 (아래에 ID 입력)"}
                 ]
             },
             {
                 "id": "target_rk",
                 "type": "text",
-                "label": "🚀 콕 집어서 수동 분리 (ID를 넣고 실행하면, 분리 후 표가 날아가지 않고 새로고침 됩니다!)",
+                "label": "🚀 콕 집어서 수동 분리 (전체 재검색 없이 표에서 즉시 삭제됩니다)",
                 "placeholder": "표에 있는 ID (RK) 숫자 입력 -> 그대로 [작업 실행] 클릭"
             }
         ],
@@ -99,10 +102,9 @@ def run(data, core_api):
 
     section_id = data.get('target_section', 'all')
     work_type = data.get('work_type', 'find_multipath')
-    target_rk = data.get('target_rk', '').strip()
     
     task = core_api['task']
-    task.log(f"작업 시작 (대상 섹션: {section_id}, 기본 작업: {work_type})")
+    task.log(f"작업 시작 (대상 섹션: {section_id}, 작업 유형: {work_type})")
     
     # 기기 식별자(Machine ID) 가져오기
     machine_id = ""
@@ -113,23 +115,65 @@ def run(data, core_api):
         task.log(f"Plex 서버 연결 중 오류 (클릭 링크 생성이 제한될 수 있음): {e}")
 
     # -------------------------------------------------------------------------
-    # [우선 실행] 특정 항목 수동 분리 (Rating Key 입력 시 무조건 먼저 실행)
+    # [작업 0] 특정 항목 수동 분리 (재검색 방지 캐시 조작 방식)
     # -------------------------------------------------------------------------
-    if target_rk.isdigit():
-        task.log(f"-> [수동 분리 요청] ID {target_rk} 항목 분리를 먼저 시도합니다...")
+    if work_type == 'manual_split':
+        target_rk = data.get('target_rk', '').strip()
+        if not target_rk.isdigit():
+            return {"status": "error", "message": "유효한 ID(숫자)를 입력해주세요."}, 400
+            
+        task.log(f"수동 분리 시작 (ID: {target_rk})...")
         try:
             plex_instance = core_api['get_plex']()
             item = plex_instance.fetchItem(int(target_rk))
             title = item.title
+            
+            # 1. 분리 명령 실행
             try:
                 item.split()
-                task.log(f"-> 🟢 [수동 분리 완료] '{title}' 항목이 분리되었습니다! (이제 목록을 새로고침 합니다.)")
+                task.log(f"-> 🟢 [수동 분리 완료] '{title}' 항목이 분리되었습니다.")
             except Exception as e:
-                task.log(f"-> 🟡 [수동 분리 스킵] '{title}' (이미 분리되었거나 분리할 수 없는 항목: {e})")
+                task.log(f"-> 🟡 [수동 분리 스킵] 분리할 수 없는 항목이거나 이미 분리됨: {e}")
+                
+            task.update_state('running', progress=100, total=100)
+            
+            # 2. [핵심] 재검색 없이 메모리(캐시)에 있는 표 데이터를 직접 수정
+            try:
+                current_dir = os.path.dirname(os.path.abspath(__file__))
+                base_dir = os.path.dirname(os.path.dirname(current_dir))
+                log_dir = os.path.join(base_dir, 'task_logs')
+                
+                # PMH 코어가 저장해둔 데이터테이블 캐시 파일 찾기
+                search_pattern = os.path.join(log_dir, "multipath_finder_*_data.json")
+                cache_files = glob.glob(search_pattern)
+                
+                if cache_files:
+                    data_file = cache_files[0]
+                    with open(data_file, 'r', encoding='utf-8') as f:
+                        cached_data = json.load(f)
+                        
+                    if 'data' in cached_data:
+                        # 리스트에서 방금 분리한 항목의 rating_key만 제거
+                        cached_data['data'] = [row for row in cached_data['data'] if str(row.get('rating_key')) != str(target_rk)]
+                        
+                        # 수정된 표 데이터를 캐시에 다시 덮어쓰기
+                        with open(data_file, 'w', encoding='utf-8') as f:
+                            json.dump(cached_data, f, ensure_ascii=False, indent=2)
+                            
+                        task.log("-> ⚡ 전체 재검색 없이 표에서 해당 항목만 즉시 삭제(새로고침) 했습니다!")
+                        
+                        # 프론트엔드에 조작된 기존 데이터를 그대로 던져주어 화면을 자연스럽게 갱신
+                        return cached_data, 200
+                        
+            except Exception as cache_e:
+                task.log(f"캐시 업데이트 실패 (재검색 필요): {cache_e}")
+
+            # 만약 캐시 파일을 못 찾았을 경우 뜨는 폴백(Fallback) 알림
+            return {"status": "success", "message": f"'{title}' 분리가 완료되었습니다. (표를 갱신하시려면 검색을 다시 해주세요)"}, 200
+
         except Exception as e:
             task.log(f"-> 🔴 [수동 분리 오류] ID {target_rk} 항목을 서버에서 찾을 수 없습니다: {e}")
-
-    # (수동 분리를 마친 후, 화면을 유지하기 위해 사용자가 선택한 검색을 연달아 실행합니다)
+            return {"status": "error", "message": f"수동 분리 실패: {str(e)}"}, 500
 
     # -------------------------------------------------------------------------
     # [작업 1 & 2] 다중 경로 검색 및 일괄 분리(Split)
