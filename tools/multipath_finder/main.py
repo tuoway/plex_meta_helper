@@ -11,6 +11,7 @@
    를 호출해주면 프론트엔드 모니터링 탭에 파란색 진행률 바가 부드럽게 차오릅니다.
 """
 
+import urllib.parse
 import unicodedata
 import os
 import re
@@ -102,6 +103,14 @@ def run(data, core_api):
     task = core_api['task']
     task.log(f"작업 시작 (대상 섹션: {section_id}, 작업 유형: {work_type})")
     
+    # [수정 포인트] 기기 식별자(Machine ID) 가져오기 (Plex Web URL 생성용)
+    machine_id = ""
+    try:
+        plex = core_api['get_plex']()
+        machine_id = plex.machineIdentifier
+    except Exception as e:
+        task.log(f"Plex 서버 연결 중 오류 (클릭 링크 생성이 제한될 수 있음): {e}")
+
     # -------------------------------------------------------------------------
     # [작업 1 & 2] 다중 경로 검색 및 분리(Split)
     # -------------------------------------------------------------------------
@@ -135,9 +144,13 @@ def run(data, core_api):
                 title = candidate['title']
                 sec_name = candidate['section_name']
                 
+                # [수정 포인트] 절대 URL 생성
+                key_encoded = urllib.parse.quote(f"/library/metadata/{rk_id}", safe='')
+                plex_web_url = f"https://app.plex.tv/desktop/#!/server/{machine_id}/details?key={key_encoded}" if machine_id else ""
+                
                 root_paths = set()
                 
-                # 영화 (Type 1) - 맞춤형 폴더 추출(extract_movie_folder) 사용
+                # 영화 (Type 1)
                 if m_type == 1:
                     files = core_api['query']("""
                         SELECT mp.file FROM media_items m 
@@ -150,7 +163,7 @@ def run(data, core_api):
                             raw_file = unicodedata.normalize('NFC', row['file'])
                             root_paths.add(extract_movie_folder(raw_file))
                 
-                # TV 쇼 (Type 2) - 기존 폴더 트리 추적 방식 유지
+                # TV 쇼 (Type 2)
                 elif m_type == 2:
                     files = core_api['query']("""
                         SELECT mp.file FROM metadata_items ep 
@@ -171,6 +184,7 @@ def run(data, core_api):
                         "section": sec_name,
                         "title": title,
                         "rating_key": str(rk_id),
+                        "plex_url": plex_web_url,  # 생성된 절대 링크 추가
                         "count": f"<span style='color:#e5a00d; font-weight:bold;'>{len(root_paths)}</span>",
                         "raw_count": len(root_paths),
                         "folders": ", ".join(root_paths)
@@ -209,7 +223,8 @@ def run(data, core_api):
                 "default_sort": [{"key": "section", "dir": "asc"}, {"key": "title", "dir": "asc"}],
                 "columns": [
                     {"key": "section", "label": "섹션", "width": "15%", "align": "left", "header_align": "center", "sortable": True},
-                    {"key": "title", "label": "제목 (클릭 시 이동)", "width": "35%", "align": "left", "header_align": "center", "sortable": True, "type": "link", "link_key": "rating_key"},
+                    # [수정 포인트] link_key를 plex_url로 변경
+                    {"key": "title", "label": "제목 (클릭 시 이동)", "width": "35%", "align": "left", "header_align": "center", "sortable": True, "type": "link", "link_key": "plex_url"},
                     {"key": "folders", "label": "감지된 폴더명", "width": "40%", "align": "left", "header_align": "center", "sortable": False},
                     {"key": "count", "label": "상태/병합수", "width": "10%", "align": "center", "header_align": "center", "sortable": True, "sort_key": "raw_count", "sort_type": "number"}
                 ],
@@ -245,12 +260,19 @@ def run(data, core_api):
             
             results = []
             for item in duplicates:
+                rk_id = item['id']
                 clean_guid = item['guid'].split("://")[-1].split("?")[0] if "://" in item['guid'] else item['guid']
+                
+                # [수정 포인트] 절대 URL 생성
+                key_encoded = urllib.parse.quote(f"/library/metadata/{rk_id}", safe='')
+                plex_web_url = f"https://app.plex.tv/desktop/#!/server/{machine_id}/details?key={key_encoded}" if machine_id else ""
+                
                 results.append({
                     "section": item['section_name'],
                     "title": item['title'],
-                    "rating_key": str(item['id']),
-                    "guid": clean_guid
+                    "rating_key": str(rk_id),
+                    "guid": clean_guid,
+                    "plex_url": plex_web_url  # 생성된 절대 링크 추가
                 })
 
             task.update_state('running', progress=100, total=100)
@@ -261,7 +283,8 @@ def run(data, core_api):
                 "default_sort": [{"key": "guid", "dir": "asc"}, {"key": "title", "dir": "asc"}],
                 "columns": [
                     {"key": "section", "label": "섹션", "width": "15%", "align": "left", "header_align": "center", "sortable": True},
-                    {"key": "title", "label": "제목 (클릭 시 이동)", "width": "50%", "align": "left", "header_align": "center", "sortable": True, "type": "link", "link_key": "rating_key"},
+                    # [수정 포인트] link_key를 plex_url로 변경
+                    {"key": "title", "label": "제목 (클릭 시 이동)", "width": "50%", "align": "left", "header_align": "center", "sortable": True, "type": "link", "link_key": "plex_url"},
                     {"key": "guid", "label": "Plex GUID", "width": "35%", "align": "left", "header_align": "center", "sortable": True}
                 ],
                 "data": results
