@@ -1,182 +1,158 @@
-# -*- coding: utf-8 -*-
-"""
-[PMH Tool Reference Template] - 다중 경로(병합 오류 의심) 항목 검색
-
-* PMH Tool 아키텍처 핵심 가이드 (데이터테이블 반환형):
-1. DB에서 조건에 맞는 데이터를 모두 조회하여 배열 형태로 반환하면, 
-   코어와 프론트엔드가 페이징과 정렬을 알아서 처리합니다.
-2. 프론트엔드에서 항목의 제목을 클릭했을 때 Plex 상세 페이지로 이동하게 하려면, 
-   컬럼 속성에 `type: "link"` 와 `link_key: "데이터_키_이름"` 을 지정해주면 됩니다.
-3. 시간이 오래 걸리는 조회 작업의 경우 `task.update_state('running', progress=..., total=...)` 
-   를 호출해주면 프론트엔드 모니터링 탭에 파란색 진행률 바가 부드럽게 차오릅니다.
-"""
-
-import unicodedata
 import os
 import re
+import urllib.parse
+from plexapi.server import PlexServer
 
-def is_season_folder(folder_name):
-    """폴더명이 시즌(Season) 폴더인지 판별합니다."""
-    name_lower = unicodedata.normalize('NFC', folder_name).lower().strip()
-    if re.match(r'^(season|시즌|series|s)\s*\d+\b', name_lower): return True
-    if re.match(r'^(specials?|스페셜|extras?|특집|ova|ost)(\s*\d+)?$', name_lower): return True
-    if name_lower.isdigit(): return True
-    return False
+class PlexMultipathManager:
+    def __init__(self, plex_url, plex_token):
+        """
+        Plex 서버 객체를 초기화하고 머신 식별자를 가져옵니다.
+        """
+        self.plex_server = PlexServer(plex_url, plex_token)
+        self.machine_id = self.plex_server.machineIdentifier
 
-def get_unique_root_path(raw_file):
-    """파일 경로를 받아, 시즌 폴더 등을 무시한 진짜 최상위(루트) 쇼/영화 폴더 경로를 반환합니다."""
-    dir_path = os.path.dirname(raw_file)
-    while True:
-        base_name = os.path.basename(dir_path)
-        if not base_name: break
-        if is_season_folder(base_name):
-            parent_path = os.path.dirname(dir_path)
-            if parent_path == dir_path: break
-            dir_path = parent_path
-        else:
-            break
-    return os.path.normpath(dir_path).replace('\\', '/').lower()
+    def extract_movie_folder(self, filepath):
+        """
+        주어진 경로에서 실제 영화 폴더명을 추출합니다.
+        기준 경로 패턴: /영화/제목/[가~0Z 등 임의의폴더]/[실제_영화_폴더명]/
+        """
+        # 사용자 맞춤형 정규식: /영화/제목/ 다음에 오는 1뎁스 폴더를 건너뛰고 그 다음 폴더명을 캡처
+        match = re.search(r'/영화/제목/[^/]+/([^/]+)/', filepath)
+        if match:
+            return match.group(1)
+        
+        # 위 패턴에 맞지 않는 경우, 기본적으로 파일이 위치한 직속 부모 폴더명을 반환
+        return os.path.basename(os.path.dirname(filepath))
 
-# =====================================================================
-# 1. PMH Tool 표준 인터페이스 (UI 스키마)
-# =====================================================================
-def get_ui(core_api):
-    sections = [{"value": "all", "text": "전체 라이브러리 (All)"}]
-    try:
-        # 안전한 샌드박스 DB 쿼리 실행 (코어가 제공하는 읽기 전용 쿼리)
-        rows = core_api['query']("SELECT id, name FROM library_sections ORDER BY name")
-        for r in rows:
-            sections.append({"value": str(r['id']), "text": r['name']})
-    except Exception:
-        pass
+    def split_incorrectly_merged_movies(self, library_name):
+        """
+        1. 제목 폴더가 다른 데 묶인 경우 풀기 (Split)
+        하나의 영화 항목 내에 존재하는 파일들이 서로 다른 폴더에 위치한 경우 분리합니다.
+        """
+        print(f"\n['{library_name}' 라이브러리: 잘못 병합된 항목 스캔 시작]")
+        try:
+            library = self.plex_server.library.section(library_name)
+            movies = library.all()
+        except Exception as e:
+            print(f"라이브러리를 불러오는 데 실패했습니다: {e}")
+            return
 
-    return {
-        "title": "다중 경로(병합 오류 의심) 항목 검색",
-        "description": "서로 다른 폴더 경로를 가진 파일들이 하나의 메타(쇼/영화)로 병합된 항목을 찾습니다.",
-        "inputs": [
-            {"id": "target_section", "type": "select", "label": "검사할 라이브러리 섹션", "options": sections}
-        ],
-        "button_text": "다중 경로 항목 검색"
-    }
+        split_count = 0
 
-# =====================================================================
-# 2. 메인 실행 및 데이터 추출 로직
-# =====================================================================
-def run(data, core_api):
-    # 페이지/정렬 요청은 코어가 자체적으로 캐시를 읽어 처리하므로 예외를 던집니다.
-    action = data.get('action_type', 'preview')
-    if action == 'page': 
-        return {"status": "error", "message": "데이터테이블 툴은 페이징을 코어가 전담합니다."}, 400
+        for movie in movies:
+            # 항목 내 모든 실제 물리 파일 경로 수집
+            file_locations = []
+            for media in movie.media:
+                for part in media.parts:
+                    if part.file:
+                        file_locations.append(part.file)
+            
+            # 묶여 있는 파일이 2개 이상일 때만 검사
+            if len(file_locations) < 2:
+                continue
+                
+            # 각 파일이 위치한 실제 영화 폴더명 추출 및 중복 제거
+            movie_folders = set()
+            for filepath in file_locations:
+                folder_name = self.extract_movie_folder(filepath)
+                movie_folders.add(folder_name)
+            
+            # 폴더명이 2개 이상이라면 서로 다른 영화가 병합된 것으로 간주
+            if len(movie_folders) > 1:
+                print(f"\n[분리 대상 발견] {movie.title} (ID: {movie.ratingKey})")
+                print(f"  - 감지된 독립 폴더들: {', '.join(movie_folders)}")
+                
+                try:
+                    movie.split()
+                    split_count += 1
+                    print(f"  -> 성공적으로 분리(Split) 되었습니다.")
+                except Exception as e:
+                    print(f"  -> 분리 실패: {e}")
+                    
+        print(f"\n[스캔 완료] 총 {split_count}개의 항목이 분리되었습니다.")
 
-    section_id = data.get('target_section', 'all')
-    
-    # [Reference] 작업 매니저를 호출하여 프론트엔드 모니터링 탭에 로그를 실시간으로 뿌려줍니다.
-    task = core_api['task']
-    task.log(f"다중 경로 검색 시작 (대상 섹션: {section_id})")
-    
-    # 파라미터 바인딩을 사용할 쿼리 작성 (SQLite 인젝션 방지)
-    query = """
-        SELECT mi.id, mi.metadata_type, mi.title, ls.name AS section_name, ls.id AS sec_id
-        FROM metadata_items mi
-        JOIN library_sections ls ON mi.library_section_id = ls.id
-        WHERE (? = 'all' OR ls.id = ?) AND mi.metadata_type IN (1, 2)
+    def find_duplicate_guid_movies(self, library_name):
+        """
+        2. 제목이 같고 GUID가 같은 경우 찾기
+        동일한 GUID를 공유하는 중복 항목들을 찾아 웹에서 즉시 수정할 수 있는 링크를 제공합니다.
+        """
+        print(f"\n['{library_name}' 라이브러리: 중복 GUID 항목 스캔 시작]")
+        try:
+            library = self.plex_server.library.section(library_name)
+            movies = library.all()
+        except Exception as e:
+            print(f"라이브러리를 불러오는 데 실패했습니다: {e}")
+            return
+
+        # GUID를 키로 하여 영화 객체들을 리스트로 그룹화
+        guid_map = {}
+        for movie in movies:
+            guid = movie.guid
+            if guid not in guid_map:
+                guid_map[guid] = []
+            guid_map[guid].append(movie)
+            
+        found_duplicates = False
+        
+        for guid, items in guid_map.items():
+            # 동일한 GUID를 가진 항목이 2개 이상인 경우 (중복)
+            if len(items) > 1:
+                found_duplicates = True
+                print(f"\n[중복 GUID 그룹] {guid}")
+                
+                for item in items:
+                    # Plex Web 링크 생성을 위한 URL 인코딩
+                    key_encoded = urllib.parse.quote(item.key, safe='')
+                    plex_web_url = f"https://app.plex.tv/desktop/#!/server/{self.machine_id}/details?key={key_encoded}"
+                    
+                    # 출력용 파일 경로 추출 (첫 번째 파일 기준)
+                    file_path = "경로 없음"
+                    if item.media and item.media[0].parts and item.media[0].parts[0].file:
+                        file_path = item.media[0].parts[0].file
+                    
+                    print(f"  - 제목: {item.title} (ID: {item.ratingKey})")
+                    print(f"    경로: {file_path}")
+                    print(f"    수정 링크: {plex_web_url}")
+                    
+        if not found_duplicates:
+            print("\n중복된 GUID를 가진 항목이 없습니다. 모두 정상입니다.")
+
+def main():
     """
-    
-    results = []
-    try:
-        task.log("1. 분석 대상 컨텐츠 목록 수집 중...")
-        # 쿼리에 들어갈 ? 값을 튜플로 전달
-        candidates = core_api['query'](query, (section_id, section_id))
-        total_candidates = len(candidates)
-        
-        # [Reference] 프론트엔드 진행률 바(Progress Bar)를 활성화하기 위해 전체 개수를 셋팅
-        task.update_state('running', total=total_candidates)
-        task.log(f"2. 총 {total_candidates:,}개의 컨텐츠 내부 파일 경로 분석 중...")
-        
-        for idx, candidate in enumerate(candidates, 1):
-            
-            # [Reference] 1,000건 단위로 텍스트 로그 출력 (프론트엔드 화면에 스크롤 됨)
-            if idx % 1000 == 0:
-                task.log(f"   -> {idx:,} / {total_candidates:,} 건 분석 완료...")
-                
-            # [Reference] 100건 단위로 진행률 게이지(퍼센트) 업데이트
-            if idx % 100 == 0:
-                task.update_state('running', progress=idx)
-                
-            rk_id = candidate['id']
-            m_type = candidate['metadata_type']
-            title = candidate['title']
-            sec_name = candidate['section_name']
-            
-            root_paths = set()
-            
-            # 영화 (Type 1)
-            if m_type == 1:
-                files = core_api['query']("""
-                    SELECT mp.file FROM media_items m 
-                    JOIN media_parts mp ON mp.media_item_id = m.id 
-                    WHERE m.metadata_item_id = ?
-                """, (rk_id,))
-                
-                for row in files:
-                    if row.get('file'):
-                        raw_file = unicodedata.normalize('NFC', row['file'])
-                        root_paths.add(get_unique_root_path(raw_file))
-            
-            # TV 쇼 (Type 2 - 하위 에피소드까지 탐색)
-            elif m_type == 2:
-                files = core_api['query']("""
-                    SELECT mp.file FROM metadata_items ep 
-                    JOIN metadata_items sea ON ep.parent_id = sea.id 
-                    JOIN media_items m ON m.metadata_item_id = ep.id 
-                    JOIN media_parts mp ON mp.media_item_id = m.id 
-                    WHERE sea.parent_id = ? AND ep.metadata_type = 4
-                """, (rk_id,))
-                
-                for row in files:
-                    if row.get('file'):
-                        raw_file = unicodedata.normalize('NFC', row['file'])
-                        root_paths.add(get_unique_root_path(raw_file))
+    메인 실행 함수: CLI 메뉴를 구성하고 사용자의 입력을 처리합니다.
+    """
+    # 환경 변수 또는 하드코딩으로 Plex 접속 정보를 입력하세요.
+    PLEX_URL = os.environ.get('PLEX_URL', 'http://localhost:32400')
+    PLEX_TOKEN = os.environ.get('PLEX_TOKEN', 'YOUR_PLEX_TOKEN_HERE')
+    LIBRARY_NAME = '영화'
 
-            # 루트 경로가 서로 다른 2개 이상이 묶여있다면 "병합 의심 항목"으로 추가
-            if len(root_paths) > 1:
-                results.append({
-                    "section": sec_name,
-                    "title": title,
-                    "rating_key": str(rk_id),
-                    # 화면에 보여질 HTML 텍스트 서식
-                    "count": f"<span style='color:#e5a00d; font-weight:bold;'>{len(root_paths)}</span>",
-                    # 테이블 정렬(오름/내림차순)을 위해 사용할 순수 숫자 데이터
-                    "raw_count": len(root_paths)
-                })
-        
-        # 마지막으로 진행률 바를 100%로 꽉 채워줍니다.
-        task.update_state('running', progress=total_candidates)
-        task.log(f"검색 완료! {len(results):,}건의 의심 항목을 찾았습니다.")
-        
+    print("=== Plex 매칭 오류 수정 도구 ===")
+    print("Plex 서버에 연결 중입니다...")
+    
+    try:
+        manager = PlexMultipathManager(PLEX_URL, PLEX_TOKEN)
+        print("서버에 성공적으로 연결되었습니다.")
     except Exception as e:
-        task.log(f"DB 검색 중 오류: {str(e)}")
-        return {"status": "error", "message": f"DB 검색 중 오류: {str(e)}"}, 500
+        print(f"서버 연결 실패: {e}")
+        return
+    
+    while True:
+        print(f"\n[현재 타겟 라이브러리: {LIBRARY_NAME}]")
+        print("1. 잘못 병합된 항목 자동 분리 (폴더명 기준)")
+        print("2. GUID 중복 항목 검색 및 수동 수정 링크 보기")
+        print("0. 프로그램 종료")
         
-    # =========================================================================
-    # [프론트엔드 반환 포맷: Datatable Schema]
-    # =========================================================================
-    return {
-        "status": "success",
-        "type": "datatable",
-        "default_sort": [
-            {"key": "section", "dir": "asc"},
-            {"key": "title", "dir": "asc"}
-        ],
-        "columns": [
-            {"key": "section", "label": "섹션", "width": "25%", "align": "left", "header_align": "center", "sortable": True},
-            
-            # [Reference] 프론트엔드가 클릭 가능한 링크를 생성하도록 type을 "link"로 지정하고 
-            # 데이터 배열 안의 rating_key 값을 참조하도록 link_key 매핑
-            {"key": "title", "label": "제목 (클릭 시 이동)", "width": "60%", "align": "left", "header_align": "center", "sortable": True, "type": "link", "link_key": "rating_key"},
-            
-            # [Reference] 화면에 보여주는 데이터와 정렬용 데이터를 분리
-            {"key": "count", "label": "병합 수", "width": "15%", "align": "center", "header_align": "center", "sortable": True, "sort_key": "raw_count", "sort_type": "number"}
-        ],
-        "data": results
-    }, 200
+        choice = input("원하시는 작업 번호를 입력하세요: ")
+        
+        if choice == '1':
+            manager.split_incorrectly_merged_movies(LIBRARY_NAME)
+        elif choice == '2':
+            manager.find_duplicate_guid_movies(LIBRARY_NAME)
+        elif choice == '0':
+            print("작업을 종료합니다.")
+            break
+        else:
+            print("잘못된 입력입니다. 0, 1, 2 중 하나를 입력해주세요.")
+
+if __name__ == "__main__":
+    main()
